@@ -1,33 +1,39 @@
 """
 Market Analyzer & Trade Idea Generator — Pure Price Action / Supply & Demand
 Multi-timeframe day-trading version: 4H structure/zones, 5M entry trigger.
+Filtered for higher-quality setups: trend-aligned, fresh zones only, with
+rejection confirmation and a 3:1 risk:reward target.
 =============================================================================
-No indicators (no moving averages, RSI, MACD, etc). Pure price action:
+No indicators. Pure price action:
 
-  1. STRUCTURE & ZONES (4H): swing highs/lows classify trend (higher-highs/
-     higher-lows = uptrend, lower-highs/lower-lows = downtrend). Supply &
+  1. STRUCTURE & ZONES (4H): swing highs/lows classify trend. Supply &
      demand zones are the consolidation ("base") right before a strong
      directional move away from it.
-  2. ENTRY TRIGGER (5M): once price is trading inside a valid 4H zone, the
-     5-minute chart is checked for a confirmation candle (engulfing /
-     rejection) before a live entry signal fires. This avoids entering the
-     moment price touches a zone — it waits for the zone to actually react.
-  3. NEWS FILTER (ForexFactory "red folder" high-impact events): entries
-     are suppressed inside a blackout window around high-impact news for
-     the relevant currency.
-  4. BACKTEST (honesty check): reports a historical win rate for the zone
-     strategy so you're trusting a tested process, not a blind promise.
-     IMPORTANT DATA LIMITS (free Yahoo Finance data):
-       - 5-minute candles: last ~60 days only.
-       - Hourly candles (used to build 4H bars): last ~2 years only.
-       - Daily candles: full history (several years+).
-     True 4-year backtesting at 5-minute resolution is not possible with
-     free data. The 4H zone backtest below covers ~2 years (the max
-     available). For genuine multi-year, tick-accurate backtesting, use
-     your XM MetaTrader Strategy Tester with the broker's own history.
+  2. QUALITY FILTERS: a zone only qualifies for a signal if —
+       - it's FRESH (never touched since it formed)
+       - it's TREND-ALIGNED (demand zones only trade long during a 4H
+         uptrend; supply zones only trade short during a 4H downtrend —
+         counter-trend zone bounces are skipped)
+       - price shows a REJECTION at the zone (a wick, not just a touch)
+  3. ENTRY TRIGGER (5M): once a zone passes those filters and price is
+     inside it, the 5-minute chart is checked for a confirmation candle
+     (engulfing/rejection) before a live entry signal fires.
+  4. RISK:REWARD: stop is placed a small buffer beyond the zone; target is
+     3x that risk by default (configurable).
+  5. NEWS FILTER (ForexFactory "red folder"): entries are suppressed near
+     high-impact news for the relevant currency.
+  6. BACKTEST: applies the SAME filters (fresh + trend-aligned + rejection
+     confirmation) historically, over ~2 years of 4H data, and reports the
+     actual resulting win rate — this is not a promise, it's a measurement.
+
+IMPORTANT — win rate and reward:risk are not independent. A wider RR target
+is statistically harder to reach and will tend to reduce win rate, not
+increase it. Nothing here guarantees future accuracy; treat the backtest
+numbers as a filter for whether a setup is even worth considering, not as
+a promise.
 
 THIS TOOL DOES NOT PLACE TRADES. Review manually in XM. Not financial
-advice, and no win rate shown here is a promise about future performance.
+advice.
 
 Install:  pip install yfinance pandas numpy requests --break-system-packages
 Run:      python market_analyzer.py
@@ -71,27 +77,30 @@ SYMBOL_CURRENCIES = {
     "GBP/USD": {"USD", "GBP"},
 }
 
-# --- Structure/zone timeframe (4H, built by resampling 1H data) ---
 STRUCTURE_SOURCE_INTERVAL = "1h"
-STRUCTURE_SOURCE_PERIOD = "730d"    # Yahoo's max history for hourly data (~2y)
+STRUCTURE_SOURCE_PERIOD = "730d"
 STRUCTURE_RULE = "4h"
 
-# --- Entry trigger timeframe ---
 ENTRY_INTERVAL = "5m"
-ENTRY_PERIOD = "60d"                # Yahoo's max history for 5m data
+ENTRY_PERIOD = "60d"
 
 SWING_WINDOW = 3
 BASE_LOOKBACK = 4
 RANGE_BASELINE_LOOKBACK = 10
-IMPULSE_MULTIPLIER = 1.7
+IMPULSE_MULTIPLIER = 2.2        # raised: only strong, clean impulse legs count as zones
 
-# How close to "now" a high-impact news event has to be (either side) to
-# suppress a live entry signal.
 NEWS_BLACKOUT_MINUTES = 30
 
-# Backtest settings (run on the 4H structure timeframe, ~2 years of data)
-BACKTEST_LOOKAHEAD_CANDLES = 20     # how many 4H candles to watch after a zone is touched
-BACKTEST_RR = 1.5                   # target = risk x this multiple
+# --- Quality filters (applied to BOTH live signals and the backtest) ---
+REQUIRE_FRESH_ZONE = True        # only ever act on a zone's first touch
+REQUIRE_TREND_ALIGNMENT = True   # only trade zones in the direction of 4H structure
+REQUIRE_REJECTION_CANDLE = True  # touch must show a rejection wick, not just a pass-through
+
+# --- Risk:reward ---
+STOP_BUFFER_PCT = 0.15           # stop placed this much extra beyond the zone (of zone height)
+TARGET_RR = 3.0                  # target = risk x this multiple
+
+BACKTEST_LOOKAHEAD_CANDLES = 30  # widened since a 3R target takes longer to reach than 1.5R did
 
 FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
@@ -118,8 +127,10 @@ class Analysis:
     demand_zone: Zone = None
     supply_zone: Zone = None
     inside_zone: str = None
+    qualifies: bool = False       # passed fresh + trend-alignment filters
     entry_signal: bool = False
     entry_reason: str = ""
+    trade_levels: dict = None     # {"entry":.., "stop":.., "target":.., "rr":..}
     news_blackout: bool = False
     news_blackout_reason: str = ""
     backtest: dict = None
@@ -186,13 +197,19 @@ def classify_structure(swing_highs, swing_lows) -> str:
     return "Ranging / structure transitioning"
 
 
+def structure_at(swing_highs, swing_lows, idx: int) -> str:
+    """Structure as it would have looked using only data available up to
+    `idx` — avoids look-ahead bias when backtesting."""
+    sh = [s for s in swing_highs if s[0] <= idx]
+    sl = [s for s in swing_lows if s[0] <= idx]
+    return classify_structure(sh, sl)
+
+
 # ---------------------------------------------------------------------------
 # SUPPLY & DEMAND ZONES
 # ---------------------------------------------------------------------------
 
 def raw_zones(df: pd.DataFrame) -> list:
-    """All zones ever formed in the dataset (used for backtesting), before
-    filtering out the ones price has since broken through."""
     ranges = df["High"] - df["Low"]
     zones = []
     for i in range(RANGE_BASELINE_LOOKBACK, len(df)):
@@ -232,7 +249,6 @@ def raw_zones(df: pd.DataFrame) -> list:
 
 
 def valid_zones_now(df: pd.DataFrame, zones: list) -> list:
-    """Zones not yet broken by the end of the dataset, marked fresh/tested."""
     out = []
     for z in zones:
         after = df.iloc[z["formed_idx"] + 1:]
@@ -262,11 +278,43 @@ def nearest_zones(zones: list, current_price: float):
 
 
 # ---------------------------------------------------------------------------
+# RISK / TARGET LEVELS (shared by live signals and backtest)
+# ---------------------------------------------------------------------------
+
+def compute_trade_levels(kind: str, low: float, high: float,
+                          buffer_pct: float = STOP_BUFFER_PCT, rr: float = TARGET_RR) -> dict:
+    height = high - low
+    buffer = height * buffer_pct
+    if kind == "demand":
+        entry = high
+        stop = low - buffer
+        risk = entry - stop
+        target = entry + risk * rr
+    else:
+        entry = low
+        stop = high + buffer
+        risk = stop - entry
+        target = entry - risk * rr
+    return {"entry": entry, "stop": stop, "target": target, "rr": rr, "risk": risk}
+
+
+def has_rejection(row) -> tuple:
+    """Returns (bullish_rejection, bearish_rejection) for a single OHLC row —
+    True if the candle's close sits in the half of its range away from the
+    wick that probed the zone (i.e. it got rejected, not just touched)."""
+    candle_range = row["High"] - row["Low"]
+    if candle_range <= 0:
+        return False, False
+    bullish_rejection = (row["Close"] - row["Low"]) > 0.5 * candle_range
+    bearish_rejection = (row["High"] - row["Close"]) > 0.5 * candle_range
+    return bullish_rejection, bearish_rejection
+
+
+# ---------------------------------------------------------------------------
 # 5-MINUTE ENTRY TRIGGER
 # ---------------------------------------------------------------------------
 
 def find_5m_trigger(df5: pd.DataFrame, direction: str, lookback_candles: int = 12):
-    """direction: 'bullish' (looking for demand-zone reaction) or 'bearish'."""
     recent = df5.tail(lookback_candles).reset_index(drop=True)
     for i in range(len(recent) - 1, 0, -1):
         cur, prev = recent.iloc[i], recent.iloc[i - 1]
@@ -278,11 +326,11 @@ def find_5m_trigger(df5: pd.DataFrame, direction: str, lookback_candles: int = 1
             return True, f"Bullish engulfing candle on 5M at {cur['Time'].strftime('%H:%M UTC')}"
         if direction == "bearish" and bearish_engulf:
             return True, f"Bearish engulfing candle on 5M at {cur['Time'].strftime('%H:%M UTC')}"
-    return False, "Price is at the zone but no confirmed 5M reaction candle yet — wait."
+    return False, "Price is at a qualified zone but no confirmed 5M reaction candle yet — wait."
 
 
 # ---------------------------------------------------------------------------
-# ECONOMIC CALENDAR (ForexFactory "red folder" = High impact)
+# ECONOMIC CALENDAR
 # ---------------------------------------------------------------------------
 
 def fetch_economic_calendar() -> list:
@@ -301,9 +349,7 @@ def upcoming_high_impact_events(events: list, currencies: set, hours_ahead: int 
     relevant = []
     for ev in events:
         try:
-            if ev.get("impact") != "High":
-                continue
-            if ev.get("country") not in currencies:
+            if ev.get("impact") != "High" or ev.get("country") not in currencies:
                 continue
             ev_time = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
             if now <= ev_time <= cutoff:
@@ -328,54 +374,67 @@ def check_news_blackout(events: list, currencies: set, minutes: int = NEWS_BLACK
 
 
 # ---------------------------------------------------------------------------
-# BACKTEST (4H zone reliability, ~2 years — see data-limit note at top)
+# BACKTEST — same filters as live signals: fresh + trend-aligned + rejection
 # ---------------------------------------------------------------------------
 
-def evaluate_zone_outcome(df, z, touch_idx, lookahead, rr):
-    risk = z["high"] - z["low"]
-    if risk <= 0:
-        return None
-    if z["kind"] == "demand":
-        stop, target = z["low"], z["high"] + risk * rr
-    else:
-        stop, target = z["high"], z["low"] - risk * rr
+def evaluate_zone_outcome(df, kind, low, high, touch_idx, lookahead):
+    levels = compute_trade_levels(kind, low, high)
     window = df.iloc[touch_idx + 1: touch_idx + 1 + lookahead]
     for _, row in window.iterrows():
-        if z["kind"] == "demand":
-            if row["Low"] <= stop:
+        if kind == "demand":
+            if row["Low"] <= levels["stop"]:
                 return "loss"
-            if row["High"] >= target:
+            if row["High"] >= levels["target"]:
                 return "win"
         else:
-            if row["High"] >= stop:
+            if row["High"] >= levels["stop"]:
                 return "loss"
-            if row["Low"] <= target:
+            if row["Low"] <= levels["target"]:
                 return "win"
     return None
 
 
-def backtest_zones(df: pd.DataFrame, zones: list) -> dict:
-    wins = losses = no_result = 0
+def backtest_zones(df: pd.DataFrame, zones: list, swing_highs, swing_lows) -> dict:
+    wins = losses = no_result = skipped_filters = 0
     for z in zones:
+        # trend alignment, assessed using only data available at zone formation
+        if REQUIRE_TREND_ALIGNMENT:
+            structure = structure_at(swing_highs, swing_lows, z["formed_idx"])
+            aligned = ((z["kind"] == "demand" and structure.startswith("Uptrend")) or
+                       (z["kind"] == "supply" and structure.startswith("Downtrend")))
+            if not aligned:
+                skipped_filters += 1
+                continue
+
+        # find the first touch (this IS the "fresh" touch by construction —
+        # REQUIRE_FRESH_ZONE just means we never look past this first one)
         touch_idx = None
         for idx in range(z["formed_idx"] + 1, len(df)):
             row = df.iloc[idx]
             if row["Low"] <= z["high"] and row["High"] >= z["low"]:
+                if REQUIRE_REJECTION_CANDLE:
+                    bull_rej, bear_rej = has_rejection(row)
+                    rejected = bull_rej if z["kind"] == "demand" else bear_rej
+                    if not rejected:
+                        continue  # touched but no rejection — keep looking
                 touch_idx = idx
                 break
         if touch_idx is None:
             continue
-        outcome = evaluate_zone_outcome(df, z, touch_idx, BACKTEST_LOOKAHEAD_CANDLES, BACKTEST_RR)
+
+        outcome = evaluate_zone_outcome(df, z["kind"], z["low"], z["high"], touch_idx, BACKTEST_LOOKAHEAD_CANDLES)
         if outcome == "win":
             wins += 1
         elif outcome == "loss":
             losses += 1
         else:
             no_result += 1
+
     resolved = wins + losses
     win_rate = (wins / resolved * 100) if resolved else None
     return {"wins": wins, "losses": losses, "no_result": no_result,
-            "total_zones": len(zones), "win_rate": win_rate}
+            "skipped_by_filters": skipped_filters, "total_zones": len(zones),
+            "win_rate": win_rate, "rr": TARGET_RR}
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +442,6 @@ def backtest_zones(df: pd.DataFrame, zones: list) -> dict:
 # ---------------------------------------------------------------------------
 
 def analyze_symbol(name: str, ticker: str, calendar: list) -> Analysis:
-    # 4H structure & zones, built from 1H data
     df1h = fetch_ohlc(ticker, STRUCTURE_SOURCE_INTERVAL, STRUCTURE_SOURCE_PERIOD)
     df4h = resample_ohlc(df1h, STRUCTURE_RULE)
     current_price = float(df4h["Close"].iloc[-1])
@@ -395,7 +453,7 @@ def analyze_symbol(name: str, ticker: str, calendar: list) -> Analysis:
     zones = valid_zones_now(df4h, z_raw)
     demand_zone, supply_zone, inside = nearest_zones(zones, current_price)
 
-    backtest = backtest_zones(df4h, z_raw)
+    backtest = backtest_zones(df4h, z_raw, swing_highs, swing_lows)
 
     notes = []
     bias = "Neutral"
@@ -422,29 +480,56 @@ def analyze_symbol(name: str, ticker: str, calendar: list) -> Analysis:
     if not demand_zone and not supply_zone:
         notes.append("No clear valid 4H zones found in the lookback window.")
 
-    # --- News blackout check (red folder) ---
+    # --- Does the current situation even qualify for consideration? ---
+    qualifies = False
+    active_zone = None
+    if inside == "demand" and demand_zone:
+        active_zone = demand_zone
+        fresh_ok = (not REQUIRE_FRESH_ZONE) or demand_zone.fresh
+        trend_ok = (not REQUIRE_TREND_ALIGNMENT) or bullish_structure
+        qualifies = fresh_ok and trend_ok
+        if not fresh_ok:
+            notes.append("Demand zone has already been tested before — skipped (fresh-zone filter).")
+        elif not trend_ok:
+            notes.append("Demand zone is counter-trend against the current 4H downtrend — skipped (trend filter).")
+    elif inside == "supply" and supply_zone:
+        active_zone = supply_zone
+        fresh_ok = (not REQUIRE_FRESH_ZONE) or supply_zone.fresh
+        trend_ok = (not REQUIRE_TREND_ALIGNMENT) or bearish_structure
+        qualifies = fresh_ok and trend_ok
+        if not fresh_ok:
+            notes.append("Supply zone has already been tested before — skipped (fresh-zone filter).")
+        elif not trend_ok:
+            notes.append("Supply zone is counter-trend against the current 4H uptrend — skipped (trend filter).")
+
+    # --- News blackout ---
     currencies = SYMBOL_CURRENCIES.get(name, {"USD"})
     blackout, blackout_reason = check_news_blackout(calendar, currencies) if calendar else (False, "")
 
-    # --- 5-minute entry trigger, only checked when price is inside a zone ---
-    entry_signal, entry_reason = False, "Price is not currently inside a valid zone — no entry to evaluate yet."
-    if inside in ("demand", "supply") and not blackout:
+    # --- 5-minute entry trigger + trade levels, only if qualified ---
+    entry_signal, entry_reason = False, "No qualified zone reaction to evaluate right now."
+    trade_levels = None
+    if qualifies and active_zone and not blackout:
+        trade_levels = compute_trade_levels(active_zone.kind, active_zone.low, active_zone.high)
         try:
             df5 = fetch_ohlc(ticker, ENTRY_INTERVAL, ENTRY_PERIOD)
-            direction = "bullish" if inside == "demand" else "bearish"
+            direction = "bullish" if active_zone.kind == "demand" else "bearish"
             entry_signal, entry_reason = find_5m_trigger(df5, direction)
         except Exception as e:
             entry_reason = f"Could not fetch 5M data for entry trigger: {e}"
     elif blackout:
         entry_reason = f"Entry suppressed — inside red-news blackout window: {blackout_reason}"
+    elif inside in ("demand", "supply") and not qualifies:
+        entry_reason = "Price is at a zone, but it didn't pass the quality filters above — no signal."
 
     if entry_signal:
-        notes.append("Day-trade reminder: this is an intraday setup — plan your exit and close before end of session, don't hold overnight.")
+        notes.append("Day-trade reminder: plan your exit and close before end of session — don't hold overnight.")
 
     return Analysis(
         symbol=name, last_price=current_price, structure=structure, bias=bias,
         demand_zone=demand_zone, supply_zone=supply_zone, inside_zone=inside,
-        entry_signal=entry_signal, entry_reason=entry_reason,
+        qualifies=qualifies, entry_signal=entry_signal, entry_reason=entry_reason,
+        trade_levels=trade_levels,
         news_blackout=blackout, news_blackout_reason=blackout_reason,
         backtest=backtest, notes=notes,
     )
@@ -470,14 +555,21 @@ def build_trade_idea(a: Analysis, news_events: list) -> str:
 
     lines.append(f"  5M Entry signal: {'YES — ' + a.entry_reason if a.entry_signal else 'No — ' + a.entry_reason}")
 
+    if a.trade_levels:
+        t = a.trade_levels
+        lines.append(f"  Levels if triggered: entry {t['entry']:.2f} | stop {t['stop']:.2f} | "
+                      f"target {t['target']:.2f} (risk:reward {t['rr']:.1f}:1)")
+
     if a.news_blackout:
         lines.append(f"  \u26a0 RED NEWS BLACKOUT: {a.news_blackout_reason} — do not enter.")
 
     if a.backtest and a.backtest["win_rate"] is not None:
         bt = a.backtest
-        lines.append(f"  Backtest (4H zones, ~last 2y): {bt['wins']}W/{bt['losses']}L "
+        lines.append(f"  Backtest (filtered, 4H zones, ~2y): {bt['wins']}W/{bt['losses']}L "
                       f"({bt['win_rate']:.0f}% win rate on {bt['wins']+bt['losses']} resolved zones, "
-                      f"{bt['no_result']} inconclusive). Past results are not a guarantee of future ones.")
+                      f"{bt['no_result']} inconclusive, {bt['skipped_by_filters']} skipped by filters) "
+                      f"at {bt['rr']:.1f}:1 RR. Breakeven win rate at this RR is {100/(1+bt['rr']):.0f}%. "
+                      f"Past results are not a guarantee of future ones.")
 
     if news_events:
         lines.append("  Upcoming high-impact news (next 48h):")
@@ -501,6 +593,7 @@ CARD_HTML = """
   <div class="stats"><span class="label">Last</span><span class="value">{last_price:.2f}</span></div>
   <div class="zones">{zones_html}</div>
   <div class="entry {entry_class}">{entry_html}</div>
+  {levels_html}
   {blackout_html}
   <div class="notes">{notes_html}</div>
   <div class="backtest">{backtest_html}</div>
@@ -565,11 +658,13 @@ HTML_SHELL = """<!DOCTYPE html>
   .entry {{ font-size: 0.88rem; font-weight: 600; margin-bottom: 8px; padding: 8px 10px; border-radius: 8px; }}
   .entry.signal-yes {{ background: rgba(22,163,74,0.12); color: var(--bull); }}
   .entry.signal-no {{ background: rgba(107,114,128,0.10); color: var(--muted); font-weight: 500; }}
+  .levels {{ font-size: 0.8rem; color: var(--text); background: rgba(107,114,128,0.08);
+             padding: 6px 10px; border-radius: 8px; margin-bottom: 8px; }}
   .blackout {{ font-size: 0.82rem; font-weight: 600; color: var(--warn); background: rgba(217,119,6,0.12);
                padding: 6px 10px; border-radius: 8px; margin-bottom: 8px; }}
   .notes {{ font-size: 0.8rem; color: var(--muted); margin-bottom: 8px; }}
   .notes div {{ margin-bottom: 3px; }}
-  .backtest {{ font-size: 0.78rem; color: var(--muted); border-top: 1px solid var(--border); padding-top: 8px; margin-bottom: 8px; }}
+  .backtest {{ font-size: 0.76rem; color: var(--muted); border-top: 1px solid var(--border); padding-top: 8px; margin-bottom: 8px; }}
   .news {{ font-size: 0.8rem; border-top: 1px solid var(--border); padding-top: 8px; color: var(--muted); }}
   footer {{ text-align: center; color: var(--muted); font-size: 0.75rem; padding: 20px 0 8px; }}
 </style>
@@ -577,14 +672,15 @@ HTML_SHELL = """<!DOCTYPE html>
 <body>
 <header>
   <h1>\U0001F4CA Daily Market Report</h1>
-  <p>Generated {generated_at} &middot; 4H structure/zones, 5M entry, red-news filter</p>
+  <p>Generated {generated_at} &middot; 4H zones (trend-aligned, fresh-only, rejection-confirmed), 5M entry, 3:1 RR</p>
 </header>
 <div class="disclaimer">
   Educational tool only — not financial advice, not a guarantee of accuracy.
   Prices are a Yahoo Finance proxy, delayed and not identical to XM's live
   feed. 5M data covers ~60 days, 4H data ~2 years (Yahoo's free-tier
-  limits) — backtest win rates reflect that window, not 4 full years.
-  Always verify on your own XM chart before trading.
+  limits). Backtest win rates reflect that window with the same filters as
+  live signals — they are a measurement of the past, not a promise about
+  the future. Always verify on your own XM chart before trading.
 </div>
 {cards}
 <footer>Re-generated automatically. Day-trade setups only — no overnight holds implied.</footer>
@@ -618,23 +714,31 @@ def render_news_html(news_events: list) -> str:
 def render_backtest_html(bt: dict) -> str:
     if not bt or bt["win_rate"] is None:
         return "Not enough historical zone touches yet to backtest."
-    return (f"Backtest (4H zones, ~2y history): {bt['wins']}W/{bt['losses']}L "
-            f"({bt['win_rate']:.0f}% win rate, {bt['no_result']} inconclusive). "
-            f"Past results aren't a guarantee of future ones.")
+    breakeven = 100 / (1 + bt["rr"])
+    return (f"Filtered backtest (4H zones, ~2y): {bt['wins']}W/{bt['losses']}L "
+            f"({bt['win_rate']:.0f}% win rate, {bt['no_result']} inconclusive, "
+            f"{bt['skipped_by_filters']} skipped by filters) at {bt['rr']:.1f}:1 RR "
+            f"(breakeven needs {breakeven:.0f}%). Not a guarantee of future results.")
 
 
 def generate_html_report(results: list, output_path: str):
     cards_html = ""
     for analysis, news in results:
         entry_class = "signal-yes" if analysis.entry_signal else "signal-no"
-        entry_html = ("\u2705 ENTRY SIGNAL: " + analysis.entry_reason) if analysis.entry_signal else ("No entry yet: " + analysis.entry_reason)
+        entry_html = ("\u2705 ENTRY SIGNAL: " + analysis.entry_reason) if analysis.entry_signal else ("No entry: " + analysis.entry_reason)
         blackout_html = f'<div class="blackout">\u26a0 RED NEWS BLACKOUT: {analysis.news_blackout_reason}</div>' if analysis.news_blackout else ""
+        levels_html = ""
+        if analysis.trade_levels:
+            t = analysis.trade_levels
+            levels_html = (f'<div class="levels">Entry {t["entry"]:.2f} | Stop {t["stop"]:.2f} | '
+                            f'Target {t["target"]:.2f} ({t["rr"]:.1f}:1 RR)</div>')
 
         cards_html += CARD_HTML.format(
             symbol=analysis.symbol, bias=analysis.bias, bias_class=analysis.bias,
             structure=analysis.structure, last_price=analysis.last_price,
             zones_html=render_zones_html(analysis),
             entry_class=entry_class, entry_html=entry_html,
+            levels_html=levels_html,
             blackout_html=blackout_html,
             notes_html=render_notes_html(analysis.notes),
             backtest_html=render_backtest_html(analysis.backtest),
@@ -658,7 +762,7 @@ def generate_html_report(results: list, output_path: str):
 def main():
     print(f"Market Analysis Report — generated {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("=" * 60)
-    print("4H structure/zones, 5M entry trigger, red-news filter. No indicators.")
+    print("4H zones (trend-aligned, fresh-only, rejection-confirmed), 5M entry, 3:1 RR.")
     print("NOTE: Educational tool only. Not financial advice. No accuracy guarantee.")
     print("=" * 60)
 
